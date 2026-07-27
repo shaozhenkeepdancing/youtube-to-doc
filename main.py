@@ -11,8 +11,8 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
     RequestBlocked,
     IpBlocked,
-    NotFound,
-    CookiesInvalid,
+    InvalidVideoId,
+    CookieInvalid,
 )
 
 # --- 配置区域 ---
@@ -144,8 +144,8 @@ def get_transcript_text(video_id):
         print(f"[{video_id}] 视频不可用（可能被删除或地区限制）。")
         return None
 
-    except NotFound:
-        print(f"[{video_id}] 视频不存在。")
+    except InvalidVideoId:
+        print(f"[{video_id}] 视频不存在或 ID 无效。")
         return None
 
     except Exception as e:
