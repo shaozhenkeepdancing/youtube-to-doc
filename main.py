@@ -1,7 +1,8 @@
 import os
 import json
 import re
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -15,7 +16,10 @@ from youtube_transcript_api._errors import (
 )
 
 # --- 配置区域 ---
-SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "{}"))
+# OAuth2 用户认证（走你个人 Google 账号的 15GB 配额）
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN", "")
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 
 # 获取频道 ID 字符串，并用逗号拆分成列表
@@ -60,11 +64,22 @@ def create_ytt_api():
 
 
 # --- API 客户端初始化 ---
+# 使用 OAuth2 用户认证（走你个人 Google 账号的 15GB 配额）
 scopes = [
-    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
 ]
-creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=scopes)
+creds = Credentials(
+    token=None,
+    refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+    client_id=GOOGLE_OAUTH_CLIENT_ID,
+    client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+    token_uri="https://oauth2.googleapis.com/token",
+    scopes=scopes,
+)
+# 刷新 access token
+creds.refresh(GoogleAuthRequest())
+
 drive_service = build("drive", "v3", credentials=creds)
 docs_service = build("docs", "v1", credentials=creds)
 youtube_service = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
