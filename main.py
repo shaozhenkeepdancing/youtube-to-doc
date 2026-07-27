@@ -1,8 +1,10 @@
-import os
+import subprocess
 import json
+import tempfile
+import os
+import glob
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from youtube_transcript_api import YouTubeTranscriptApi
 
 # --- 配置区域 ---
 SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "{}"))
@@ -62,29 +64,50 @@ def get_latest_video_id(channel_id):
         return None, None
 
 
-from youtube_transcript_api import YouTubeTranscriptApi
-
 def get_transcript_text(video_id):
-    try:
-        # 方案 1：尝试最新版 API 语法（实例化对象）
-        try:
-            ytt_api = YouTubeTranscriptApi()
-            transcript_list = ytt_api.list_transcripts(video_id)
-            try:
-                transcript = transcript_list.find_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
-            except Exception:
-                transcript = transcript_list.find_generated_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
-            fetched = transcript.fetch()
-            return "\n".join([item['text'] for item in fetched])
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_template = os.path.join(tmpdir, "subtitle")
         
-        # 方案 2：如果环境是旧版，自动切回旧版静态方法
-        except AttributeError:
-            fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh-Hant', 'zh'])
-            return "\n".join([item['text'] for item in fetched])
-
-    except Exception as e:
-        print(f"获取字幕失败，错误原因: {e}")
-        return None
+        # 使用 yt-dlp 命令行抓取字幕（优先字幕：英文、简体中文、繁体中文，含自动生成字幕）
+        cmd = [
+            "yt-dlp",
+            "--write-sub",
+            "--write-auto-sub",
+            "--sub-lang", "en,zh-Hans,zh-Hant,zh",
+            "--sub-format", "json3",
+            "--skip-download",
+            "-o", output_template,
+            video_url
+        ]
+        
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            
+            # 查找生成的 json3 字幕文件
+            sub_files = glob.glob(os.path.join(tmpdir, "*.json3"))
+            if not sub_files:
+                print(f"未找到可用字幕文件 ({video_id})")
+                return None
+            
+            # 读取并解析字幕内容
+            with open(sub_files[0], 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            lines = []
+            for event in data.get('events', []):
+                if 'segs' in event:
+                    text = "".join([seg.get('utf8', '') for seg in event['segs']]).strip()
+                    if text and text != '\n':
+                        lines.append(text)
+                        
+            full_text = "\n".join(lines)
+            return full_text if full_text else None
+            
+        except Exception as e:
+            print(f"获取字幕失败，错误原因: {e}")
+            return None
 
 
 def create_file_in_drive_folder(folder_id, title, text):
