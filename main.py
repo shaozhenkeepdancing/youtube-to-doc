@@ -3,7 +3,6 @@ import json
 import re
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
@@ -61,9 +60,13 @@ def create_ytt_api():
 
 
 # --- API 客户端初始化 ---
-scopes = ["https://www.googleapis.com/auth/drive.file"]
+scopes = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/documents",
+]
 creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=scopes)
 drive_service = build("drive", "v3", credentials=creds)
+docs_service = build("docs", "v1", credentials=creds)
 youtube_service = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 ytt_api = create_ytt_api()
@@ -190,26 +193,34 @@ def get_transcript_text(video_id):
 
 
 def create_file_in_drive_folder(folder_id, title, text):
-    """在指定 Google Drive 文件夹内新建字幕文件"""
+    """在指定 Google Drive 文件夹内新建字幕文件（Google Doc）。
+    使用 Docs API 写入内容，不占用 Drive 存储配额。
+    """
     safe_title = "".join(c for c in title if c not in r'/\:*?"<>|')
 
+    # 第一步：用 Drive API 创建空的 Google Doc
     file_metadata = {
         "name": safe_title,
         "parents": [folder_id],
         "mimeType": "application/vnd.google-apps.document",
     }
+    file = drive_service.files().create(body=file_metadata, fields="id").execute()
+    file_id = file.get("id")
 
-    media = MediaInMemoryUpload(
-        text.encode("utf-8"), mimetype="text/plain", resumable=True
-    )
+    # 第二步：用 Docs API 写入文本内容（Google Docs 不占存储配额）
+    requests = [
+        {
+            "insertText": {
+                "location": {"index": 1},
+                "text": text,
+            }
+        }
+    ]
+    docs_service.documents().batchUpdate(
+        documentId=file_id, body={"requests": requests}
+    ).execute()
 
-    file = (
-        drive_service.files()
-        .create(body=file_metadata, media_body=media, fields="id")
-        .execute()
-    )
-
-    print(f"成功创建字幕文件: {title} (File ID: {file.get('id')})")
+    print(f"成功创建字幕文件: {title} (File ID: {file_id})")
 
 
 if __name__ == "__main__":
