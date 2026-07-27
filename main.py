@@ -67,7 +67,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 def get_transcript_text(video_id):
     try:
         # 优先按语言顺序查找：英文 -> 简体中文 -> 繁体中文
-        fetched_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh-Hant', 'zh'])
+        fetched_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh'])
         # 拼接字幕内容
         text = "\n".join([item['text'] for item in fetched_transcript])
         return text
