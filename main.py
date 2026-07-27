@@ -5,6 +5,7 @@ import os
 import glob
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from youtube_transcript_api import YouTubeTranscriptApi
 
 # --- 配置区域 ---
 SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "{}"))
@@ -63,29 +64,34 @@ def get_latest_video_id(channel_id):
         print(f"获取频道 [{channel_id}] 最新视频失败: {e}")
         return None, None
 
-import urllib.request
-import re
-import json
-import xml.etree.ElementTree as ET
+from youtube_transcript_api import YouTubeTranscriptApi
 
 def get_transcript_text(video_id):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-    
     try:
-        html = urllib.request.urlopen(req).read().decode('utf-8')
-        # 匹配 YouTube 网页底部的 Initial Player Response 数据包
-        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});</script>', html)
-        if not match:
-            print(f"未能在页面中匹配到字幕元数据 ({video_id})")
-            return None
+        # 1. 获取该视频的所有字幕轨列表（包含人工字幕与自动生成字幕）
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
-        player_data = json.loads(match.group(1))
-        captions = player_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+        # 2. 智能筛选字幕
+        try:
+            # 优先找人工创建的英文或中文
+            transcript = transcript_list.find_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
+        except Exception:
+            try:
+                # 其次找自动生成的英文或中文
+                transcript = transcript_list.find_generated_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
+            except Exception:
+                # 如果都没有，直接获取第一个任意语言的可用字幕
+                transcript = next(iter(transcript_list))
+
+        # 3. 提取字幕文本内容
+        fetched = transcript.fetch()
+        lines = [item['text'] for item in fetched if item.get('text')]
         
-        if not captions:
-            print(f"该视频无可用字幕轨 ({video_id})")
-            return None
+        return "\n".join(lines) if lines else None
+
+    except Exception as e:
+        print(f"获取字幕失败 ({video_id}): {e}")
+        return None
             
         # 优先提取英文或中文，没有就取第一个字幕轨
         target_track = captions[0]
