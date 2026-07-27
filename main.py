@@ -1,11 +1,9 @@
-import subprocess
+import urllib.request
 import json
-import tempfile
-import os
-import glob
+import re
+import xml.etree.ElementTree as ET
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from youtube_transcript_api import YouTubeTranscriptApi
 
 # --- 配置区域 ---
 SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "{}"))
@@ -64,61 +62,73 @@ def get_latest_video_id(channel_id):
         print(f"获取频道 [{channel_id}] 最新视频失败: {e}")
         return None, None
 
-from youtube_transcript_api import YouTubeTranscriptApi
+import urllib.request
+import json
+import xml.etree.ElementTree as ET
 
 def get_transcript_text(video_id):
+    # 模拟 Android 移动端请求，绕过 GitHub Actions IP 封锁与网页限制
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7'
+    }
+    
     try:
-        # 1. 获取该视频的所有字幕轨列表（包含人工字幕与自动生成字幕）
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        req = urllib.request.Request(url, headers=headers)
+        html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
         
-        # 2. 智能筛选字幕
-        try:
-            # 优先找人工创建的英文或中文
-            transcript = transcript_list.find_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
-        except Exception:
-            try:
-                # 其次找自动生成的英文或中文
-                transcript = transcript_list.find_generated_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
-            except Exception:
-                # 如果都没有，直接获取第一个任意语言的可用字幕
-                transcript = next(iter(transcript_list))
-
-        # 3. 提取字幕文本内容
-        fetched = transcript.fetch()
-        lines = [item['text'] for item in fetched if item.get('text')]
-        
-        return "\n".join(lines) if lines else None
-
-    except Exception as e:
-        print(f"获取字幕失败 ({video_id}): {e}")
-        return None
+        # 匹配 YouTube Player 数据的关键 JSON 字符串
+        import re
+        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', html)
+        if not match:
+            # 降级匹配
+            match = re.search(r'var\040ytInitialPlayerResponse\s*=\s*({.+?});', html)
             
-        # 优先提取英文或中文，没有就取第一个字幕轨
+        if not match:
+            print(f"[{video_id}] 未能解析出视频播放元数据")
+            return None
+
+        player_data = json.loads(match.group(1))
+        captions = player_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+
+        if not captions:
+            print(f"[{video_id}] 视频无公开可用的字幕轨")
+            return None
+
+        # 优先查找英/中文字幕
         target_track = captions[0]
         for track in captions:
             lang = track.get('languageCode', '')
             if lang in ['en', 'zh-Hans', 'zh-Hant', 'zh']:
                 target_track = track
                 break
-                
+
+        # 拿到字幕链接并请求 XML 字幕
         sub_url = target_track['baseUrl']
-        xml_data = urllib.request.urlopen(sub_url).read().decode('utf-8')
-        
-        # 解析 XML 格式字幕
+        sub_req = urllib.request.Request(sub_url, headers=headers)
+        xml_data = urllib.request.urlopen(sub_req, timeout=10).read().decode('utf-8')
+
+        # 解析 XML 字幕
         root = ET.fromstring(xml_data)
         lines = []
         for text_elem in root.findall('.//text'):
             if text_elem.text:
-                # 简单清洗 HTML 实体字符
-                txt = text_elem.text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&#39;', "'")
-                lines.append(txt)
-                
-        return "\n".join(lines) if lines else None
+                # 简单清洗实体字符
+                clean_text = (text_elem.text
+                              .replace('&amp;', '&')
+                              .replace('&lt;', '<')
+                              .replace('&gt;', '>')
+                              .replace('&#39;', "'")
+                              .replace('&quot;', '"'))
+                lines.append(clean_text)
+
+        full_transcript = "\n".join(lines)
+        return full_transcript if full_transcript else None
 
     except Exception as e:
-        print(f"纯 Python 字幕提取失败: {e}")
+        print(f"[{video_id}] 获取字幕发生异常: {e}")
         return None
- 
 
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件"""
