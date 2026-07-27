@@ -118,7 +118,7 @@ if __name__ == "__main__":
             continue
 
         print(f"检测到新视频: {title} ({video_id})")
-        transcript = get_transcript(video_id)
+        transcript = get_transcript_text(video_id)
         if transcript:
             create_file_in_drive_folder(GOOGLE_DRIVE_FOLDER_ID, title, transcript)
             save_processed_id(video_id)
