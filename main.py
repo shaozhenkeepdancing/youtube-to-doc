@@ -66,11 +66,22 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 def get_transcript_text(video_id):
     try:
-        # 优先按语言顺序查找：英文 -> 简体中文 -> 繁体中文
-        fetched_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh'])
-        # 拼接字幕内容
-        text = "\n".join([item['text'] for item in fetched_transcript])
-        return text
+        # 方案 1：尝试最新版 API 语法（实例化对象）
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            transcript_list = ytt_api.list_transcripts(video_id)
+            try:
+                transcript = transcript_list.find_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
+            except Exception:
+                transcript = transcript_list.find_generated_transcript(['en', 'zh-Hans', 'zh-Hant', 'zh'])
+            fetched = transcript.fetch()
+            return "\n".join([item['text'] for item in fetched])
+        
+        # 方案 2：如果环境是旧版，自动切回旧版静态方法
+        except AttributeError:
+            fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh-Hant', 'zh'])
+            return "\n".join([item['text'] for item in fetched])
+
     except Exception as e:
         print(f"获取字幕失败，错误原因: {e}")
         return None
