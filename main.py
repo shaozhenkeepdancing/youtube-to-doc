@@ -62,16 +62,17 @@ def get_latest_video_id(channel_id):
         return None, None
 
 
-def get_transcript(video_id):
-    """提取视频字幕文本"""
+from youtube_transcript_api import YouTubeTranscriptApi
+
+def get_transcript_text(video_id):
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(
-            video_id, languages=["zh-Hans", "zh", "en"]
-        )
-        text = "\n".join([item["text"] for item in transcript_list])
+        # 优先按语言顺序查找：英文 -> 简体中文 -> 繁体中文
+        fetched_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'zh-Hans', 'zh-Hant', 'zh'])
+        # 拼接字幕内容
+        text = "\n".join([item['text'] for item in fetched_transcript])
         return text
     except Exception as e:
-        print(f"获取字幕失败或该视频无可用字幕: {e}")
+        print(f"获取字幕失败，错误原因: {e}")
         return None
 
 
