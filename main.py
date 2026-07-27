@@ -1,8 +1,7 @@
 import os
 import json
 import re
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -16,10 +15,8 @@ from youtube_transcript_api._errors import (
 )
 
 # --- 配置区域 ---
-# OAuth2 用户认证（走你个人 Google 账号的 15GB 配额）
-GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
-GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
-GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN", "")
+# Service Account 认证（JSON 密钥）
+SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_KEY", "{}"))
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 
 # 获取频道 ID 字符串，并用逗号拆分成列表
@@ -30,8 +27,6 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 HISTORY_FILE = "processed_videos.txt"
 
 # --- 代理配置（可选）---
-# 如果 GitHub Actions 被 YouTube IP 屏蔽，可配置代理绕过。
-# 推荐 Webshare 免费套餐：https://www.webshare.io/ (10个免费代理)
 WEBSHARE_USERNAME = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
 WEBSHARE_PASSWORD = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
 HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
@@ -40,7 +35,6 @@ HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "")
 
 def create_ytt_api():
     """初始化 YouTubeTranscriptApi，支持可选代理"""
-    # 优先使用 Webshare 代理（内置集成，最简单）
     if WEBSHARE_USERNAME and WEBSHARE_PASSWORD:
         from youtube_transcript_api.proxies import WebshareProxyConfig
         print("使用 Webshare 代理访问 YouTube...")
@@ -50,7 +44,6 @@ def create_ytt_api():
         )
         return YouTubeTranscriptApi(proxy_config=proxy_config)
 
-    # 通用代理（兼容各种 HTTP/HTTPS 代理）
     if HTTP_PROXY or HTTPS_PROXY:
         from youtube_transcript_api.proxies import GenericProxyConfig
         print("使用通用代理访问 YouTube...")
@@ -64,27 +57,81 @@ def create_ytt_api():
 
 
 # --- API 客户端初始化 ---
-# 使用 OAuth2 用户认证（走你个人 Google 账号的 15GB 配额）
+# 需要 drive（完整权限）才能列出/删除文件进行清理
 scopes = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
 ]
-creds = Credentials(
-    token=None,
-    refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
-    client_id=GOOGLE_OAUTH_CLIENT_ID,
-    client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
-    token_uri="https://oauth2.googleapis.com/token",
-    scopes=scopes,
-)
-# 刷新 access token
-creds.refresh(GoogleAuthRequest())
-
+creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=scopes)
 drive_service = build("drive", "v3", credentials=creds)
 docs_service = build("docs", "v1", credentials=creds)
 youtube_service = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 ytt_api = create_ytt_api()
+
+
+def cleanup_drive():
+    """清理服务账号 Drive 的存储空间：清空回收站 + 删除旧文件。
+    Google Doc 本身不占存储配额，但之前用 MediaInMemoryUpload 上传的
+    文件会占配额，需要清理掉才能继续创建新文件。
+    """
+    try:
+        # 1. 清空回收站（回收站里的文件也占配额）
+        drive_service.files().emptyTrash().execute()
+        print("已清空回收站")
+    except Exception as e:
+        print(f"清空回收站失败（可忽略）: {e}")
+
+    try:
+        # 2. 列出服务账号创建的所有文件
+        all_files = []
+        page_token = None
+        while True:
+            resp = (
+                drive_service.files()
+                .list(
+                    pageSize=200,
+                    pageToken=page_token,
+                    q="trashed = false",
+                    fields="files(id,name,createdTime,mimeType),nextPageToken",
+                    orderBy="createdTime desc",
+                )
+                .execute()
+            )
+            all_files.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if not all_files:
+            print("Drive 中没有文件，无需清理")
+            return
+
+        print(f"Drive 中共有 {len(all_files)} 个文件")
+
+        # 3. 保留最近 10 个文件，删除更早的
+        KEEP_COUNT = 10
+        if len(all_files) > KEEP_COUNT:
+            old_files = all_files[KEEP_COUNT:]
+            print(f"保留最近 {KEEP_COUNT} 个文件，删除 {len(old_files)} 个旧文件...")
+            for f in old_files:
+                try:
+                    drive_service.files().delete(
+                        fileId=f["id"], supportsAllDrives=True
+                    ).execute()
+                except Exception:
+                    pass
+            print("旧文件清理完成")
+
+        # 4. 再次清空回收站（刚删除的文件进回收站了）
+        try:
+            drive_service.files().emptyTrash().execute()
+            print("已再次清空回收站")
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"清理 Drive 时出错: {e}")
 
 
 def load_processed_ids():
@@ -132,11 +179,9 @@ def get_transcript_text(video_id):
     获取 YouTube 视频的字幕文本。
     使用 youtube-transcript-api 库，支持多语言回退。
     """
-    # 语言优先级：中文 → 英文 → 任意可用
     preferred_languages = ["zh-Hans", "zh-Hant", "zh", "zh-CN", "en", "en-US", "en-GB"]
 
     try:
-        # 方法 1：按偏好语言直接 fetch（最简洁）
         transcript = ytt_api.fetch(video_id, languages=preferred_languages)
         lines = [snippet.text for snippet in transcript]
         full_transcript = "\n".join(lines)
@@ -144,7 +189,6 @@ def get_transcript_text(video_id):
             return full_transcript
 
     except (TranscriptsDisabled, NoTranscriptFound):
-        # 该视频没有字幕，记录一下但不报错
         print(f"[{video_id}] 该视频没有可用的字幕。")
         return None
 
@@ -167,12 +211,10 @@ def get_transcript_text(video_id):
         return None
 
     except Exception as e:
-        # 兜底：尝试用 list + find_transcript 方式
         try:
             transcript_list = ytt_api.list(video_id)
             transcript = None
 
-            # 先尝试手动上传的字幕
             for lang in preferred_languages:
                 try:
                     transcript = transcript_list.find_manually_created_transcript([lang])
@@ -180,7 +222,6 @@ def get_transcript_text(video_id):
                 except NoTranscriptFound:
                     continue
 
-            # 再尝试自动生成的字幕
             if transcript is None:
                 for lang in preferred_languages:
                     try:
@@ -189,7 +230,6 @@ def get_transcript_text(video_id):
                     except NoTranscriptFound:
                         continue
 
-            # 最后取任意可用字幕
             if transcript is None:
                 transcript = next(iter(transcript_list))
 
@@ -209,7 +249,7 @@ def get_transcript_text(video_id):
 
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件（Google Doc）。
-    使用 Docs API 写入内容，不占用 Drive 存储配额。
+    使用 Docs API 写入内容，Google Doc 不占用 Drive 存储配额。
     """
     safe_title = "".join(c for c in title if c not in r'/\:*?"<>|')
 
@@ -222,7 +262,7 @@ def create_file_in_drive_folder(folder_id, title, text):
     file = drive_service.files().create(body=file_metadata, fields="id").execute()
     file_id = file.get("id")
 
-    # 第二步：用 Docs API 写入文本内容（Google Docs 不占存储配额）
+    # 第二步：用 Docs API 写入文本内容
     requests = [
         {
             "insertText": {
@@ -239,6 +279,11 @@ def create_file_in_drive_folder(folder_id, title, text):
 
 
 if __name__ == "__main__":
+    # 先清理 Drive 空间，释放配额
+    print("=== 清理 Google Drive 存储空间 ===")
+    cleanup_drive()
+    print()
+
     processed_ids = load_processed_ids()
 
     if not CHANNEL_IDS:
