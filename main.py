@@ -63,53 +63,56 @@ def get_latest_video_id(channel_id):
         print(f"获取频道 [{channel_id}] 最新视频失败: {e}")
         return None, None
 
+import urllib.request
+import re
+import json
+import xml.etree.ElementTree as ET
 
 def get_transcript_text(video_id):
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
     
-    with tempfile.TemporaryDirectory() as tmpdir:
-        output_template = os.path.join(tmpdir, "subtitle")
-        
-        # 加上伪装 Android 客户端参数，绕过 GitHub Actions IP 限制
-        cmd = [
-            "yt-dlp",
-            "--write-sub",
-            "--write-auto-sub",
-            "--sub-lang", "en,zh-Hans,zh-Hant,zh,.*",
-            "--sub-format", "json3",
-            "--skip-download",
-            "--extractor-args", "youtube:player_client=android",
-            "-o", output_template,
-            video_url
-        ]
-        
-        try:
-            # 捕获输出，防止 check=True 直接抛出异常
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
-            # 查找生成的 json3 字幕文件
-            sub_files = glob.glob(os.path.join(tmpdir, "*.json3"))
-            if not sub_files:
-                print(f"未找到可用字幕文件 ({video_id})，yt-dlp 输出: {result.stderr.strip()[:200]}")
-                return None
-            
-            # 读取并解析字幕内容
-            with open(sub_files[0], 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            lines = []
-            for event in data.get('events', []):
-                if 'segs' in event:
-                    text = "".join([seg.get('utf8', '') for seg in event['segs']]).strip()
-                    if text and text != '\n':
-                        lines.append(text)
-                        
-            full_text = "\n".join(lines)
-            return full_text if full_text else None
-            
-        except Exception as e:
-            print(f"获取字幕过程发生异常: {e}")
+    try:
+        html = urllib.request.urlopen(req).read().decode('utf-8')
+        # 匹配 YouTube 网页底部的 Initial Player Response 数据包
+        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});</script>', html)
+        if not match:
+            print(f"未能在页面中匹配到字幕元数据 ({video_id})")
             return None
+        
+        player_data = json.loads(match.group(1))
+        captions = player_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+        
+        if not captions:
+            print(f"该视频无可用字幕轨 ({video_id})")
+            return None
+            
+        # 优先提取英文或中文，没有就取第一个字幕轨
+        target_track = captions[0]
+        for track in captions:
+            lang = track.get('languageCode', '')
+            if lang in ['en', 'zh-Hans', 'zh-Hant', 'zh']:
+                target_track = track
+                break
+                
+        sub_url = target_track['baseUrl']
+        xml_data = urllib.request.urlopen(sub_url).read().decode('utf-8')
+        
+        # 解析 XML 格式字幕
+        root = ET.fromstring(xml_data)
+        lines = []
+        for text_elem in root.findall('.//text'):
+            if text_elem.text:
+                # 简单清洗 HTML 实体字符
+                txt = text_elem.text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&#39;', "'")
+                lines.append(txt)
+                
+        return "\n".join(lines) if lines else None
+
+    except Exception as e:
+        print(f"纯 Python 字幕提取失败: {e}")
+        return None
+ 
 
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件"""
