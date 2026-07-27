@@ -65,39 +65,42 @@ def get_latest_video_id(channel_id):
 
 import urllib.request
 import json
-import xml.etree.ElementTree as ET
 
 def get_transcript_text(video_id):
-    # 模拟 Android 移动端请求，绕过 GitHub Actions IP 封锁与网页限制
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    # 直接请求 YouTube 移动端的 InnerTube 官方 API 接口
+    url = "https://www.youtube.com/youtubei/v1/player"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7'
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.android.youtube/17.36.37 (Linux; U; Android 12; GB) gzip'
+    }
+    
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": "17.36.37",
+                "androidSdkVersion": 31,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": video_id
     }
     
     try:
-        req = urllib.request.Request(url, headers=headers)
-        html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+        data_bytes = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=data_bytes, headers=headers)
+        response = urllib.request.urlopen(req, timeout=10)
+        res_data = json.loads(response.read().decode('utf-8'))
         
-        # 匹配 YouTube Player 数据的关键 JSON 字符串
-        import re
-        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', html)
-        if not match:
-            # 降级匹配
-            match = re.search(r'var\040ytInitialPlayerResponse\s*=\s*({.+?});', html)
-            
-        if not match:
-            print(f"[{video_id}] 未能解析出视频播放元数据")
-            return None
-
-        player_data = json.loads(match.group(1))
-        captions = player_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-
+        # 从官方响应体中提取字幕信息
+        captions = res_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+        
         if not captions:
-            print(f"[{video_id}] 视频无公开可用的字幕轨")
+            print(f"[{video_id}] 视频确实无可用字幕轨")
             return None
 
-        # 优先查找英/中文字幕
+        # 优先选取英/中文字幕轨
         target_track = captions[0]
         for track in captions:
             lang = track.get('languageCode', '')
@@ -105,24 +108,22 @@ def get_transcript_text(video_id):
                 target_track = track
                 break
 
-        # 拿到字幕链接并请求 XML 字幕
+        # 拿到字幕数据的原始 URL
         sub_url = target_track['baseUrl']
-        sub_req = urllib.request.Request(sub_url, headers=headers)
-        xml_data = urllib.request.urlopen(sub_req, timeout=10).read().decode('utf-8')
+        
+        # 请求字幕 json 数据 (附加 fmt=json3)
+        if 'fmt=' not in sub_url:
+            sub_url += '&fmt=json3'
+            
+        sub_req = urllib.request.Request(sub_url, headers={'User-Agent': 'Mozilla/5.0'})
+        sub_data = json.loads(urllib.request.urlopen(sub_req, timeout=10).read().decode('utf-8'))
 
-        # 解析 XML 字幕
-        root = ET.fromstring(xml_data)
         lines = []
-        for text_elem in root.findall('.//text'):
-            if text_elem.text:
-                # 简单清洗实体字符
-                clean_text = (text_elem.text
-                              .replace('&amp;', '&')
-                              .replace('&lt;', '<')
-                              .replace('&gt;', '>')
-                              .replace('&#39;', "'")
-                              .replace('&quot;', '"'))
-                lines.append(clean_text)
+        for event in sub_data.get('events', []):
+            if 'segs' in event:
+                text = "".join([seg.get('utf8', '') for seg in event['segs']]).strip()
+                if text and text != '\n':
+                    lines.append(text)
 
         full_transcript = "\n".join(lines)
         return full_transcript if full_transcript else None
