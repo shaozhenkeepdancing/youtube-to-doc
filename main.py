@@ -71,9 +71,9 @@ ytt_api = create_ytt_api()
 
 
 def cleanup_drive():
-    """清理服务账号 Drive 的存储空间：清空回收站 + 删除旧文件。
-    Google Doc 本身不占存储配额，但之前用 MediaInMemoryUpload 上传的
-    文件会占配额，需要清理掉才能继续创建新文件。
+    """清理服务账号 Drive 的存储空间：删除所有自己创建的文件 + 清空回收站。
+    服务账号存储配额极小，之前上传的文件会占满配额导致无法创建新文件。
+    注意：只删除服务账号自己拥有的文件，不影响用户共享的文件夹和文件。
     """
     try:
         # 1. 清空回收站（回收站里的文件也占配额）
@@ -83,7 +83,7 @@ def cleanup_drive():
         print(f"清空回收站失败（可忽略）: {e}")
 
     try:
-        # 2. 列出服务账号创建的所有文件
+        # 2. 列出服务账号拥有的所有文件（不含共享给它的文件）
         all_files = []
         page_token = None
         while True:
@@ -92,8 +92,8 @@ def cleanup_drive():
                 .list(
                     pageSize=200,
                     pageToken=page_token,
-                    q="trashed = false",
-                    fields="files(id,name,createdTime,mimeType),nextPageToken",
+                    q="'me' in owners and trashed = false",
+                    fields="files(id,name,createdTime,mimeType,size),nextPageToken",
                     orderBy="createdTime desc",
                 )
                 .execute()
@@ -104,26 +104,21 @@ def cleanup_drive():
                 break
 
         if not all_files:
-            print("Drive 中没有文件，无需清理")
-            return
-
-        print(f"Drive 中共有 {len(all_files)} 个文件")
-
-        # 3. 保留最近 10 个文件，删除更早的
-        KEEP_COUNT = 10
-        if len(all_files) > KEEP_COUNT:
-            old_files = all_files[KEEP_COUNT:]
-            print(f"保留最近 {KEEP_COUNT} 个文件，删除 {len(old_files)} 个旧文件...")
-            for f in old_files:
+            print("服务账号没有自己的文件，无需清理")
+        else:
+            print(f"服务账号拥有 {len(all_files)} 个文件，全部删除以释放配额：")
+            for f in all_files:
+                size = f.get("size", "N/A")
+                print(f"  - [{f.get('mimeType', '?')}] {f['name']} (size: {size})")
                 try:
                     drive_service.files().delete(
                         fileId=f["id"], supportsAllDrives=True
                     ).execute()
-                except Exception:
-                    pass
-            print("旧文件清理完成")
+                except Exception as e:
+                    print(f"    删除失败: {e}")
+            print("文件清理完成")
 
-        # 4. 再次清空回收站（刚删除的文件进回收站了）
+        # 3. 再次清空回收站（刚删除的文件进回收站了）
         try:
             drive_service.files().emptyTrash().execute()
             print("已再次清空回收站")
@@ -247,35 +242,114 @@ def get_transcript_text(video_id):
     return None
 
 
+def append_to_existing_doc(folder_id, title, text):
+    """回退方案：找到共享文件夹里最新的 Google Doc，把字幕追加到末尾。
+    用于 Service Account 无法创建新文件（配额为 0）的情况。
+    """
+    MAX_DOC_CHARS = 900000  # Google Doc 上限约 102 万字符，留余量
+
+    # 查找文件夹内已有的 Google Doc
+    resp = (
+        drive_service.files()
+        .list(
+            q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed = false",
+            fields="files(id,name)",
+            orderBy="createdTime desc",
+            pageSize=50,
+        )
+        .execute()
+    )
+    docs = resp.get("files", [])
+
+    if not docs:
+        print("文件夹中没有已有的 Google Doc，无法追加。")
+        print("请手动在 Google Drive 文件夹中创建一个空的 Google Doc，然后重新运行。")
+        return False
+
+    # 遍历找到有空间的文档
+    separator = "\n\n" + "=" * 60 + f"\n\n【{title}】\n采集时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    append_text = separator + text
+
+    for doc in docs:
+        try:
+            doc_info = docs_service.documents().get(documentId=doc["id"]).execute()
+            # 计算当前文档字符数
+            current_length = 1  # Docs API 从 index 1 开始
+            for element in doc_info.get("body", {}).get("content", []):
+                end_index = element.get("endIndex", 1)
+                if end_index > current_length:
+                    current_length = end_index
+
+            remaining = MAX_DOC_CHARS - current_length
+            if remaining < len(append_text):
+                print(f"  文档 [{doc['name']}] 空间不足（剩余 {remaining} 字符），尝试下一个...")
+                continue
+
+            # 追加文本到文档末尾
+            requests = [
+                {
+                    "insertText": {
+                        "location": {"index": current_length - 1},
+                        "text": append_text,
+                    }
+                }
+            ]
+            docs_service.documents().batchUpdate(
+                documentId=doc["id"], body={"requests": requests}
+            ).execute()
+
+            print(f"成功追加字幕到已有文档: {doc['name']} (File ID: {doc['id']})")
+            return True
+
+        except Exception as e:
+            print(f"  追加到文档 [{doc['name']}] 失败: {e}")
+            continue
+
+    print("所有已有文档都已满，请手动创建新的空 Google Doc 放入文件夹后重试。")
+    return False
+
+
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件（Google Doc）。
-    使用 Docs API 写入内容，Google Doc 不占用 Drive 存储配额。
+    如果创建失败（配额不足），自动回退到追加到已有文档。
     """
     safe_title = "".join(c for c in title if c not in r'/\:*?"<>|')
 
-    # 第一步：用 Drive API 创建空的 Google Doc
-    file_metadata = {
-        "name": safe_title,
-        "parents": [folder_id],
-        "mimeType": "application/vnd.google-apps.document",
-    }
-    file = drive_service.files().create(body=file_metadata, fields="id").execute()
-    file_id = file.get("id")
-
-    # 第二步：用 Docs API 写入文本内容
-    requests = [
-        {
-            "insertText": {
-                "location": {"index": 1},
-                "text": text,
-            }
+    try:
+        # 第一步：用 Drive API 创建空的 Google Doc
+        file_metadata = {
+            "name": safe_title,
+            "parents": [folder_id],
+            "mimeType": "application/vnd.google-apps.document",
         }
-    ]
-    docs_service.documents().batchUpdate(
-        documentId=file_id, body={"requests": requests}
-    ).execute()
+        file = drive_service.files().create(body=file_metadata, fields="id").execute()
+        file_id = file.get("id")
 
-    print(f"成功创建字幕文件: {title} (File ID: {file_id})")
+        # 第二步：用 Docs API 写入文本内容
+        requests = [
+            {
+                "insertText": {
+                    "location": {"index": 1},
+                    "text": text,
+                }
+            }
+        ]
+        docs_service.documents().batchUpdate(
+            documentId=file_id, body={"requests": requests}
+        ).execute()
+
+        print(f"成功创建字幕文件: {title} (File ID: {file_id})")
+
+    except Exception as e:
+        error_str = str(e)
+        if "storageQuotaExceeded" in error_str or "quota" in error_str.lower():
+            print(f"创建新文件失败（配额不足），切换到追加模式...")
+            print(f"  错误: {e}")
+            success = append_to_existing_doc(folder_id, title, text)
+            if not success:
+                raise
+        else:
+            raise
 
 
 if __name__ == "__main__":
