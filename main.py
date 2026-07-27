@@ -70,25 +70,27 @@ def get_transcript_text(video_id):
     with tempfile.TemporaryDirectory() as tmpdir:
         output_template = os.path.join(tmpdir, "subtitle")
         
-        # 使用 yt-dlp 命令行抓取字幕（优先字幕：英文、简体中文、繁体中文，含自动生成字幕）
+        # 加上伪装 Android 客户端参数，绕过 GitHub Actions IP 限制
         cmd = [
             "yt-dlp",
             "--write-sub",
             "--write-auto-sub",
-            "--sub-lang", "en,zh-Hans,zh-Hant,zh",
+            "--sub-lang", "en,zh-Hans,zh-Hant,zh,.*",
             "--sub-format", "json3",
             "--skip-download",
+            "--extractor-args", "youtube:player_client=android",
             "-o", output_template,
             video_url
         ]
         
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            # 捕获输出，防止 check=True 直接抛出异常
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             
             # 查找生成的 json3 字幕文件
             sub_files = glob.glob(os.path.join(tmpdir, "*.json3"))
             if not sub_files:
-                print(f"未找到可用字幕文件 ({video_id})")
+                print(f"未找到可用字幕文件 ({video_id})，yt-dlp 输出: {result.stderr.strip()[:200]}")
                 return None
             
             # 读取并解析字幕内容
@@ -106,9 +108,8 @@ def get_transcript_text(video_id):
             return full_text if full_text else None
             
         except Exception as e:
-            print(f"获取字幕失败，错误原因: {e}")
+            print(f"获取字幕过程发生异常: {e}")
             return None
-
 
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件"""
