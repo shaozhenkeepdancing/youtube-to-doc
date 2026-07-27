@@ -67,19 +67,18 @@ import urllib.request
 import json
 
 def get_transcript_text(video_id):
-    # 直接请求 YouTube 移动端的 InnerTube 官方 API 接口
+    # 使用 YouTube 官方 Web 端 InnerTube 接口，格式 100% 规范
     url = "https://www.youtube.com/youtubei/v1/player"
     headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.youtube/17.36.37 (Linux; U; Android 12; GB) gzip'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
     payload = {
         "context": {
             "client": {
-                "clientName": "ANDROID",
-                "clientVersion": "17.36.37",
-                "androidSdkVersion": 31,
+                "clientName": "WEB",
+                "clientVersion": "2.20231201.00.00",
                 "hl": "en",
                 "gl": "US"
             }
@@ -93,14 +92,14 @@ def get_transcript_text(video_id):
         response = urllib.request.urlopen(req, timeout=10)
         res_data = json.loads(response.read().decode('utf-8'))
         
-        # 从官方响应体中提取字幕信息
+        # 解析字幕数据
         captions = res_data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
         
         if not captions:
-            print(f"[{video_id}] 视频确实无可用字幕轨")
+            print(f"[{video_id}] 该视频未提供可提取的字幕轨")
             return None
 
-        # 优先选取英/中文字幕轨
+        # 优先提取英/中文字幕轨
         target_track = captions[0]
         for track in captions:
             lang = track.get('languageCode', '')
@@ -108,10 +107,8 @@ def get_transcript_text(video_id):
                 target_track = track
                 break
 
-        # 拿到字幕数据的原始 URL
+        # 拿到字幕 URL 并请求 json3 格式
         sub_url = target_track['baseUrl']
-        
-        # 请求字幕 json 数据 (附加 fmt=json3)
         if 'fmt=' not in sub_url:
             sub_url += '&fmt=json3'
             
