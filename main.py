@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -242,9 +243,40 @@ def get_transcript_text(video_id):
     return None
 
 
+def format_transcript(transcript_text, line_width=90):
+    """将短字幕行合并为满宽段落，每行末尾标注字数。
+
+    YouTube 字幕 API 返回的是短行（约 30-40 字符），直接写入文档会偏左半边。
+    此函数将短行合并后按目标宽度重新分行，并在每行末尾添加 [N字] 标注。
+    """
+    # 1. 合并所有短行为连续文本
+    segments = [s.strip() for s in transcript_text.split("\n") if s.strip()]
+    flowing_text = " ".join(segments)
+
+    # 2. 按目标宽度重新分行
+    words = flowing_text.split(" ")
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = (current_line + " " + word).strip()
+        if len(test_line) <= line_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+
+    # 3. 每行末尾添加字数标注
+    formatted_lines = [f"{line}  [{len(line)}字]" for line in lines]
+    return "\n".join(formatted_lines)
+
+
 def append_to_existing_doc(folder_id, title, text):
-    """回退方案：找到共享文件夹里最新的 Google Doc，把字幕追加到末尾。
+    """回退方案：找到共享文件夹里最新的 Google Doc，把格式化字幕追加到末尾。
     用于 Service Account 无法创建新文件（配额为 0）的情况。
+    标题使用 Heading 1 样式，正文满宽排列并标注每行字数。
     """
     MAX_DOC_CHARS = 900000  # Google Doc 上限约 102 万字符，留余量
 
@@ -266,33 +298,71 @@ def append_to_existing_doc(folder_id, title, text):
         print("请手动在 Google Drive 文件夹中创建一个空的 Google Doc，然后重新运行。")
         return False
 
-    # 遍历找到有空间的文档
-    separator = "\n\n" + "=" * 60 + f"\n\n【{title}】\n采集时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    append_text = separator + text
+    # 格式化字幕内容
+    formatted_body = format_transcript(text)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    separator = "═" * 40
+    timestamp_str = f"采集时间: {now}"
 
     for doc in docs:
         try:
             doc_info = docs_service.documents().get(documentId=doc["id"]).execute()
-            # 计算当前文档字符数
+            # 计算当前文档末尾索引
             current_length = 1  # Docs API 从 index 1 开始
             for element in doc_info.get("body", {}).get("content", []):
                 end_index = element.get("endIndex", 1)
                 if end_index > current_length:
                     current_length = end_index
 
+            # 构建追加文本
+            append_text = f"\n{separator}\n{title}\n{timestamp_str}\n\n{formatted_body}\n"
+
             remaining = MAX_DOC_CHARS - current_length
             if remaining < len(append_text):
                 print(f"  文档 [{doc['name']}] 空间不足（剩余 {remaining} 字符），尝试下一个...")
                 continue
 
-            # 追加文本到文档末尾
+            # 计算插入点和各部分索引
+            insert_index = current_length - 1
+            idx = insert_index
+            idx += 1  # \n
+            idx += len(separator)  # separator
+            idx += 1  # \n
+            title_start = idx; idx += len(title); title_end = idx
+            idx += 1  # \n
+            idx += len(timestamp_str)  # timestamp
+            idx += 2  # \n\n
+            body_start = idx; idx += len(formatted_body); body_end = idx
+
+            # 插入文本并应用样式
             requests = [
                 {
                     "insertText": {
-                        "location": {"index": current_length - 1},
+                        "location": {"index": insert_index},
                         "text": append_text,
                     }
-                }
+                },
+                # 标题：Heading 1 + 居中
+                {
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": title_start, "endIndex": title_end},
+                        "paragraphStyle": {
+                            "namedStyle": "HEADING_1",
+                            "alignment": "CENTER",
+                        },
+                        "fields": "namedStyle,alignment",
+                    }
+                },
+                # 正文：两端对齐
+                {
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": body_start, "endIndex": body_end},
+                        "paragraphStyle": {
+                            "alignment": "JUSTIFIED",
+                        },
+                        "fields": "alignment",
+                    }
+                },
             ]
             docs_service.documents().batchUpdate(
                 documentId=doc["id"], body={"requests": requests}
@@ -311,12 +381,15 @@ def append_to_existing_doc(folder_id, title, text):
 
 def create_file_in_drive_folder(folder_id, title, text):
     """在指定 Google Drive 文件夹内新建字幕文件（Google Doc）。
+    标题使用 Heading 1 样式居中显示，正文满宽排列并标注每行字数。
     如果创建失败（配额不足），自动回退到追加到已有文档。
     """
     safe_title = "".join(c for c in title if c not in r'/\:*?"<>|')
+    formatted_body = format_transcript(text)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     try:
-        # 第一步：用 Drive API 创建空的 Google Doc
+        # 第一步：创建空的 Google Doc
         file_metadata = {
             "name": safe_title,
             "parents": [folder_id],
@@ -325,14 +398,50 @@ def create_file_in_drive_folder(folder_id, title, text):
         file = drive_service.files().create(body=file_metadata, fields="id").execute()
         file_id = file.get("id")
 
-        # 第二步：用 Docs API 写入文本内容
+        # 第二步：构建格式化文本
+        separator = "═" * 40
+        timestamp_str = f"采集时间: {now}"
+        full_text = f"{separator}\n{title}\n{timestamp_str}\n\n{formatted_body}\n"
+
+        # 计算各部分在文档中的索引（1-based）
+        idx = 1
+        idx += len(separator)  # separator
+        idx += 1  # \n
+        title_start = idx; idx += len(title); title_end = idx
+        idx += 1  # \n
+        idx += len(timestamp_str)  # timestamp
+        idx += 2  # \n\n
+        body_start = idx; idx += len(formatted_body); body_end = idx
+
+        # 第三步：插入文本并应用样式
         requests = [
             {
                 "insertText": {
                     "location": {"index": 1},
-                    "text": text,
+                    "text": full_text,
                 }
-            }
+            },
+            # 标题：Heading 1 样式 + 居中
+            {
+                "updateParagraphStyle": {
+                    "range": {"startIndex": title_start, "endIndex": title_end},
+                    "paragraphStyle": {
+                        "namedStyle": "HEADING_1",
+                        "alignment": "CENTER",
+                    },
+                    "fields": "namedStyle,alignment",
+                }
+            },
+            # 正文：两端对齐
+            {
+                "updateParagraphStyle": {
+                    "range": {"startIndex": body_start, "endIndex": body_end},
+                    "paragraphStyle": {
+                        "alignment": "JUSTIFIED",
+                    },
+                    "fields": "alignment",
+                }
+            },
         ]
         docs_service.documents().batchUpdate(
             documentId=file_id, body={"requests": requests}
