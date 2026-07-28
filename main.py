@@ -72,9 +72,8 @@ ytt_api = create_ytt_api()
 
 
 def cleanup_drive():
-    """清理服务账号 Drive 的存储空间：删除所有自己创建的文件 + 清空回收站。
-    服务账号存储配额极小，之前上传的文件会占满配额导致无法创建新文件。
-    注意：只删除服务账号自己拥有的文件，不影响用户共享的文件夹和文件。
+    """清理服务账号 Drive 的存储空间：只删除占配额的非 Google Doc 文件 + 清空回收站。
+    Google Doc/Sheet/Slide 本身不占存储配额，保留它们以便后续追加字幕使用。
     """
     try:
         # 1. 清空回收站（回收站里的文件也占配额）
@@ -84,7 +83,8 @@ def cleanup_drive():
         print(f"清空回收站失败（可忽略）: {e}")
 
     try:
-        # 2. 列出服务账号拥有的所有文件（不含共享给它的文件）
+        # 2. 只删除服务账号拥有的、真正占存储配额的文件（排除 Google Doc/Sheet/Slide）
+        # Google Workspace 文件 mimeType 都以 application/vnd.google-apps. 开头
         all_files = []
         page_token = None
         while True:
@@ -93,7 +93,7 @@ def cleanup_drive():
                 .list(
                     pageSize=200,
                     pageToken=page_token,
-                    q="'me' in owners and trashed = false",
+                    q="'me' in owners and trashed = false and mimeType != 'application/vnd.google-apps.document' and mimeType != 'application/vnd.google-apps.spreadsheet' and mimeType != 'application/vnd.google-apps.presentation'",
                     fields="files(id,name,createdTime,mimeType,size),nextPageToken",
                     orderBy="createdTime desc",
                 )
@@ -105,9 +105,9 @@ def cleanup_drive():
                 break
 
         if not all_files:
-            print("服务账号没有自己的文件，无需清理")
+            print("没有需要清理的存储文件（Google Doc 已保留）")
         else:
-            print(f"服务账号拥有 {len(all_files)} 个文件，全部删除以释放配额：")
+            print(f"发现 {len(all_files)} 个占用存储配额的文件，正在清理：")
             for f in all_files:
                 size = f.get("size", "N/A")
                 print(f"  - [{f.get('mimeType', '?')}] {f['name']} (size: {size})")
@@ -117,9 +117,9 @@ def cleanup_drive():
                     ).execute()
                 except Exception as e:
                     print(f"    删除失败: {e}")
-            print("文件清理完成")
+            print("存储文件清理完成")
 
-        # 3. 再次清空回收站（刚删除的文件进回收站了）
+        # 3. 再次清空回收站
         try:
             drive_service.files().emptyTrash().execute()
             print("已再次清空回收站")
@@ -161,13 +161,14 @@ def get_latest_video_id(channel_id):
 
         items = response.get("items", [])
         if not items:
-            return None, None
+            return None, None, None
         video_id = items[0]["id"]["videoId"]
         video_title = items[0]["snippet"]["title"]
-        return video_id, video_title
+        channel_title = items[0]["snippet"].get("channelTitle", "")
+        return video_id, video_title, channel_title
     except Exception as e:
         print(f"获取频道 [{channel_id}] 最新视频失败: {e}")
-        return None, None
+        return None, None, None
 
 
 def get_transcript_text(video_id):
@@ -244,10 +245,10 @@ def get_transcript_text(video_id):
 
 
 def format_transcript(transcript_text, line_width=90):
-    """将短字幕行合并为满宽段落，每行末尾标注字数。
+    """将短字幕行合并为满宽段落。
 
     YouTube 字幕 API 返回的是短行（约 30-40 字符），直接写入文档会偏左半边。
-    此函数将短行合并后按目标宽度重新分行，并在每行末尾添加 [N字] 标注。
+    此函数将短行合并后按目标宽度重新分行，填满整个页面宽度。
     """
     # 1. 合并所有短行为连续文本
     segments = [s.strip() for s in transcript_text.split("\n") if s.strip()]
@@ -268,9 +269,7 @@ def format_transcript(transcript_text, line_width=90):
     if current_line:
         lines.append(current_line)
 
-    # 3. 每行末尾添加字数标注
-    formatted_lines = [f"{line}  [{len(line)}字]" for line in lines]
-    return "\n".join(formatted_lines)
+    return "\n".join(lines)
 
 
 def append_to_existing_doc(folder_id, title, text):
@@ -478,12 +477,15 @@ if __name__ == "__main__":
 
     for channel_id in CHANNEL_IDS:
         print(f"\n正在检查频道: {channel_id} ...")
-        video_id, title = get_latest_video_id(channel_id)
+        video_id, video_title, channel_title = get_latest_video_id(channel_id)
 
         if not video_id:
             print(f"频道 [{channel_id}] 未检测到视频。")
             fail_count += 1
             continue
+
+        # 组合标题：频道名 + 空格 + 视频标题
+        title = f"{channel_title} {video_title}".strip() if channel_title else video_title
 
         if video_id in processed_ids:
             print(f"视频 [{title}] ({video_id}) 已处理过，跳过。")
