@@ -346,10 +346,10 @@ def append_to_existing_doc(folder_id, title, text):
                     "updateParagraphStyle": {
                         "range": {"startIndex": title_start, "endIndex": title_end},
                         "paragraphStyle": {
-                            "namedStyle": "HEADING_1",
+                            "namedStyleType": "HEADING_1",
                             "alignment": "CENTER",
                         },
-                        "fields": "namedStyle,alignment",
+                        "fields": "namedStyleType,alignment",
                     }
                 },
                 # 正文：两端对齐
@@ -425,10 +425,10 @@ def create_file_in_drive_folder(folder_id, title, text):
                 "updateParagraphStyle": {
                     "range": {"startIndex": title_start, "endIndex": title_end},
                     "paragraphStyle": {
-                        "namedStyle": "HEADING_1",
+                        "namedStyleType": "HEADING_1",
                         "alignment": "CENTER",
                     },
-                    "fields": "namedStyle,alignment",
+                    "fields": "namedStyleType,alignment",
                 }
             },
             # 正文：两端对齐
