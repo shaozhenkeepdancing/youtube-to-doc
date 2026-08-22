@@ -42,5 +42,10 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           if [ -f processed_videos.txt ]; then
             git add processed_videos.txt
-            git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update processed videos log [skip ci]" && git push)
+            if ! git diff --quiet --cached; then
+              git commit -m "chore: update processed videos log [skip ci]"
+              # 先拉取远程最新提交，防止手动推送导致的 push rejected
+              git pull --rebase origin main
+              git push
+            fi
           fi
