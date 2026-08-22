@@ -27,6 +27,10 @@ CHANNEL_IDS = [cid.strip() for cid in CHANNEL_IDS_STR.split(",") if cid.strip()]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 HISTORY_FILE = "processed_videos.txt"
 
+# --- 文档容量管理 ---
+MAX_DOC_CHARS = 900000  # Google Doc 上限约 102 万字符，留余量
+WARN_THRESHOLD = 100000  # 剩余容量低于此值时，在文档顶部插入备份提醒
+
 # --- 代理配置（可选）---
 WEBSHARE_USERNAME = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
 WEBSHARE_PASSWORD = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
@@ -272,13 +276,65 @@ def format_transcript(transcript_text, line_width=90):
     return "\n".join(lines)
 
 
+def get_doc_text(doc_info):
+    """从 documents().get 的响应中提取全部纯文本（用于检测文档内是否已有提醒）"""
+    parts = []
+    for element in doc_info.get("body", {}).get("content", []):
+        for pe in element.get("paragraph", {}).get("elements", []):
+            parts.append(pe.get("textRun", {}).get("content", ""))
+    return "".join(parts)
+
+
+def insert_capacity_warning(doc_id, doc_name, doc_info, remaining, avg_entry_size):
+    """文档剩余容量不足时，在文档最顶部插入一行红色加粗的备份提醒（仅插入一次）"""
+    try:
+        # 避免重复插入：检测文档中是否已有 ⚠️ 提醒
+        if "⚠️" in get_doc_text(doc_info):
+            return
+
+        est_entries = max(1, remaining // max(avg_entry_size, 1))
+        warning = (
+            f"⚠️ 本文档即将写满（剩余约 {remaining} 字符，约还可写入 {est_entries} 条字幕），"
+            f"请尽快下载备份并清空本文档\n"
+        )
+        requests = [
+            {
+                "insertText": {
+                    "location": {"index": 1},
+                    "text": warning,
+                }
+            },
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": 1, "endIndex": 1 + len(warning)},
+                    "textStyle": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "color": {"rgbColor": {"red": 0.85, "green": 0.1, "blue": 0.1}}
+                        },
+                        "fontSize": {"magnitude": 12, "unit": "PT"},
+                    },
+                    "fields": "bold,foregroundColor,fontSize",
+                }
+            },
+        ]
+        docs_service.documents().batchUpdate(
+            documentId=doc_id, body={"requests": requests}
+        ).execute()
+        print(
+            f"  ⚠️ 文档 [{doc_name}] 剩余容量不足 "
+            f"（{remaining} 字符，约 {est_entries} 条字幕），已在文档顶部插入备份提醒"
+        )
+    except Exception as e:
+        print(f"  插入容量提醒失败（不影响字幕写入）: {e}")
+
+
 def append_to_existing_doc(folder_id, title, text):
     """回退方案：找到共享文件夹里最新的 Google Doc，把格式化字幕追加到末尾。
     用于 Service Account 无法创建新文件（配额为 0）的情况。
-    标题使用 Heading 1 样式，正文满宽排列并标注每行字数。
+    标题使用 Heading 1 样式，正文满宽排列。
+    剩余容量不足时会在文档顶部插入备份提醒。
     """
-    MAX_DOC_CHARS = 900000  # Google Doc 上限约 102 万字符，留余量
-
     # 查找文件夹内已有的 Google Doc
     resp = (
         drive_service.files()
@@ -368,6 +424,13 @@ def append_to_existing_doc(folder_id, title, text):
             ).execute()
 
             print(f"成功追加字幕到已有文档: {doc['name']} (File ID: {doc['id']})")
+
+            # 写入后检查剩余容量，不足时在文档顶部插入备份提醒（仅一次）
+            remaining_after = MAX_DOC_CHARS - (current_length + len(append_text))
+            if remaining_after < WARN_THRESHOLD:
+                insert_capacity_warning(
+                    doc["id"], doc["name"], doc_info, remaining_after, len(append_text)
+                )
             return True
 
         except Exception as e:
